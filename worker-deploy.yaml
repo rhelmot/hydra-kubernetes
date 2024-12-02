@@ -1,0 +1,199 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hydra-worker-linux
+  labels:
+    app: hydra
+    role: worker
+  annotations:
+    machineType: x86_64-linux
+    runnablesPerMachine: "2"
+    ignoredRunnables: "2"
+    minMachines: "1"
+    maxMachines: "10"
+    userName: "hydra"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: hydra
+      role: worker
+      machineType: x86_64-linux
+  template:
+    metadata:
+      labels:
+        app: hydra
+        role: worker
+        machineType: x86_64-linux
+    spec:
+      terminationGracePeriodSeconds: 3600
+
+      containers:
+        - name: worker
+          resources:
+            requests:
+              cpu: "4"
+              memory: 6Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          lifecycle:
+            preStop:
+              exec:
+                command: [ "bash", "-c", "while netstat --unix | grep /nix/var/nix/daemon-socket/socket; do sleep 1; done; kill -TERM 1" ]
+          securityContext:
+            privileged: true # ...sandbox namespaces
+          image: rhelmot/hydra
+          command: [ "bash", "-c" ]
+          args:
+            - |
+                mkdir -p /var/ssh /log /var/empty /home/hydra/.ssh
+
+                cp /ssh/id_ed25519.pub /home/hydra/.ssh/authorized_keys
+                chown -R hydra:hydra /home/hydra/.ssh
+                chmod 700 /home/hydra/.ssh
+                chmod 400 /home/hydra/.ssh/authorized_keys
+
+                ssh-keygen -t ed25519 -f /var/ssh/ssh_host_ecdsa_key
+
+                exec supervisord --configuration=/hydra-config/supervisord.conf
+          volumeMounts:
+            - mountPath: /nix/var/nix/daemon-socket
+              name: nix-socket
+            - mountPath: /etc/nix
+              name: nix-config
+            - mountPath: /hydra-config
+              name: hydra-config
+            - mountPath: /etc/ssh
+              name: sshd-config
+            - mountPath: /ssh
+              name: ssh-key
+
+      volumes:
+        - name: nix-socket
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1M
+        - name: ssh-key
+          secret:
+            secretName: hydra-ssh
+        - name: nix-config
+          configMap:
+            name: hydra-config
+            items:
+              - key: nix.conf
+                path: nix.conf
+        - name: hydra-config
+          configMap:
+            name: hydra-config
+            items:
+              - key: supervisord-worker.conf
+                path: supervisord.conf
+        - name: sshd-config
+          configMap:
+            name: hydra-config
+            items:
+              - key: sshd_config
+                path: sshd_config
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hydra-worker-linux-big
+  labels:
+    app: hydra
+    role: worker
+  annotations:
+    runnablesPerMachine: "1"
+    ignoredRunnables: "0"
+    minMachines: "0"
+    maxMachines: "1"
+    userName: "hydra"
+    machineType: x86_64-linux:big-parallel
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: hydra
+      role: worker
+      machineType: x86_64-linux-big-parallel
+  template:
+    metadata:
+      labels:
+        app: hydra
+        role: worker
+        machineType: x86_64-linux-big-parallel
+    spec:
+      terminationGracePeriodSeconds: 3600
+
+      containers:
+        - name: worker
+          resources:
+            requests:
+              cpu: "16"
+              memory: 20Gi
+            limits:
+              cpu: "16"
+              memory: 20Gi
+          lifecycle:
+            preStop:
+              exec:
+                command: [ "bash", "-c", "while netstat --unix | grep /nix/var/nix/daemon-socket/socket; do sleep 1; done; kill -TERM 1" ]
+          securityContext:
+            privileged: true # ...sandbox namespaces
+          image: rhelmot/hydra
+          command: [ "bash", "-c" ]
+          args:
+            - |
+                mkdir -p /var/ssh /log /var/empty /home/hydra/.ssh
+
+                cp /ssh/id_ed25519.pub /home/hydra/.ssh/authorized_keys
+                chown -R hydra:hydra /home/hydra/.ssh
+                chmod 700 /home/hydra/.ssh
+                chmod 400 /home/hydra/.ssh/authorized_keys
+
+                ssh-keygen -t ed25519 -f /var/ssh/ssh_host_ecdsa_key
+
+                exec supervisord --configuration=/hydra-config/supervisord.conf
+          volumeMounts:
+            - mountPath: /nix/var/nix/daemon-socket
+              name: nix-socket
+            - mountPath: /etc/nix
+              name: nix-config
+            - mountPath: /hydra-config
+              name: hydra-config
+            - mountPath: /etc/ssh
+              name: sshd-config
+            - mountPath: /ssh
+              name: ssh-key
+
+      volumes:
+        - name: nix-socket
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1M
+        - name: ssh-key
+          secret:
+            secretName: hydra-ssh
+        - name: nix-config
+          configMap:
+            name: hydra-config
+            items:
+              - key: nix.conf
+                path: nix.conf
+        - name: hydra-config
+          configMap:
+            name: hydra-config
+            items:
+              - key: supervisord-worker.conf
+                path: supervisord.conf
+        - name: sshd-config
+          configMap:
+            name: hydra-config
+            items:
+              - key: sshd_config
+                path: sshd_config

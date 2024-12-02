@@ -1,0 +1,515 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hydra
+  labels:
+    app: hydra
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: hydra
+      role: main
+  template:
+    metadata:
+      labels:
+        app: hydra
+        role: main
+    spec:
+      serviceAccountName: hydra-provisioner
+      shareProcessNamespace: true
+
+      initContainers:
+        - name: postgres
+          image: rhelmot/postgres
+          resources:
+            requests:
+              cpu: 1
+              memory: 2Gi
+            limits:
+              cpu: 1.5
+              memory: 4Gi
+          restartPolicy: Always
+          command: [ "bash", "-c" ]
+          args:
+            - |
+                set -x
+                cat >/var/lib/postgresql/pg_hba.conf <<EOF
+                local all all trust
+                EOF
+                cat >/var/lib/postgresql/pg_ident.conf <<EOF
+                hydra-users hydra hydra
+                hydra-users hydra-queue-runner hydra
+                hydra-users hydra-www hydra
+                hydra-users root postgres
+                hydra-users postgres postgres
+                EOF
+
+                if ! test -e /var/lib/postgresql/data/PG_VERSION; then
+                  # Cleanup the data directory.
+                  rm -f /var/lib/postgresql/data/*.conf
+
+                  # Initialise the database.
+                  su postgres -c "initdb"
+                fi
+
+                cat >/var/lib/postgresql/data/postgresql.conf <<EOF
+                listen_addresses = 'localhost'
+                hba_file = '/var/lib/postgresql/pg_hba.conf'
+                ident_file = '/var/lib/postgresql/pg_ident.conf'
+                EOF
+                chown -R postgres:postgres /var/lib/postgresql
+                chmod 0700 /var/lib/postgresql/data
+
+                su postgres -c postgres
+          lifecycle:
+            preStop:
+              exec:
+                command: [ "bash", "-c", "kill -QUIT `head -1 /var/lib/postgresql/data/postmaster.pid`" ]
+          volumeMounts:
+            - mountPath: /var/lib/postgresql/data
+              name: hydra-postgres
+            - mountPath: /run/postgresql
+              name: postgres-socket
+
+        - name: init-store
+          image: rhelmot/hydra
+          command: [ "bash", "-c" ]
+          args:
+            - |
+                  set -ex
+
+                  mkdir -p /nix/hydra-store/{rw,work}
+                  mount -t overlay overlay -olowerdir=/nix/store,upperdir=/nix/hydra-store/rw,workdir=/nix/hydra-store/work /hack
+
+                  if ! test -e /hack-db/schema; then
+                    echo "Initiailzing database"
+                    cp -a /nix/var/nix/db/* /hack-db
+                  fi
+
+                  touch /ready
+                  sleep 99999999999
+          securityContext:
+            privileged: true
+          restartPolicy: Always
+          lifecycle:
+            preStop:
+              exec:
+                command: [ "umount", "/hack" ]
+          startupProbe:
+            exec:
+              command: [ "test", "-e", "/ready" ]
+          volumeMounts:
+            - mountPath: /nix/hydra-store
+              name: hydra-store
+            - mountPath: /hack
+              name: hydra-store-hack
+              mountPropagation: Bidirectional
+            - mountPath: /hack-db
+              name: hydra-store-db
+
+      containers:
+        - name: hydra
+          image: rhelmot/hydra
+          resources:
+            requests:
+              cpu: "1"
+              memory: 12Gi
+            limits:
+              cpu: "2"
+              memory: 12Gi
+          volumeMounts:
+            - mountPath: /provisioner
+              name: provisioner-ephemeral
+            - mountPath: /run/postgresql
+              name: postgres-socket
+            - mountPath: /var/lib/hydra
+              name: hydra-persistent
+            - mountPath: /hydra-config
+              name: hydra-config
+            - mountPath: /nix/hydra-store
+              name: hydra-store
+            - mountPath: /etc/nix
+              name: nix-config
+            - mountPath: /nix/var/nix/daemon-socket
+              name: nix-socket
+            - mountPath: /nix/var/nix/gcroots/per-user
+              name: nix-gcroots
+            - mountPath: /ssh
+              name: ssh-key
+            - mountPath: /root/.config/attic
+              name: attic-config
+            - mountPath: /nix/store
+              name: hydra-store-hack
+              mountPropagation: HostToContainer
+            - mountPath: /nix/var/nix/db
+              name: hydra-store-db
+          command: [ "bash", "-c" ]
+          args:
+            - |
+                mkdir -p /root/.ssh
+                cp /ssh/* /root/.ssh
+                chown 600 /root/.ssh/*
+
+                mkdir -p ${HYDRA_DATA}
+                chown hydra:hydra ${HYDRA_DATA}
+                chmod 0750 ${HYDRA_DATA}
+
+                mkdir -m 0700 ${HYDRA_DATA}/www || true
+                chown hydra-www:hydra ${HYDRA_DATA}/www
+
+                mkdir -m 0700 ${HYDRA_DATA}/queue-runner || true
+                mkdir -m 0750 ${HYDRA_DATA}/build-logs || true
+                mkdir -m 0750 ${HYDRA_DATA}/runcommand-logs || true
+                chown hydra-queue-runner:hydra \
+                  ${HYDRA_DATA}/queue-runner \
+                  ${HYDRA_DATA}/build-logs \
+                  ${HYDRA_DATA}/runcommand-logs
+
+                if ! [ -e ${HYDRA_DATA}/.db-created ]; then
+                  createuser -U postgres hydra && \
+                    createdb -U postgres -O hydra hydra && \
+                    touch ${HYDRA_DATA}/.db-created
+                fi
+                echo "create extension if not exists pg_trgm" | psql -U postgres
+
+                mkdir -p /nix/var/nix/gcroots/per-user/$LOGNAME/hydra-roots
+                chown -R hydra:hydra /nix/var/nix/gcroots/per-user/$LOGNAME
+                chmod -R 2775 /nix/var/nix/gcroots/per-user/$LOGNAME
+
+                mkdir -p /home/hydra-queue-runner/.ssh
+                cp /ssh/* /home/hydra-queue-runner/.ssh
+                chown -R hydra-queue-runner:hydra /home/hydra-queue-runner/.ssh
+                chmod 700 /home/hydra-queue-runner/.ssh
+                chmod 600 /home/hydra-queue-runner/.ssh/*
+
+                HYDRA_DBI="$HYDRA_DBI;application_name=hydra-init" hydra-init
+
+                ln -sf /hydra-config/crontab /etc/crontab
+
+                mkdir /log
+                exec supervisord --configuration=/hydra-config/supervisord.conf
+          env:
+            - name: HYDRA_CONFIG
+              valueFrom:
+                configMapKeyRef:
+                  name: hydra-config
+                  key: hydra-config
+            - name: HYDRA_DATA
+              valueFrom:
+                configMapKeyRef:
+                  name: hydra-config
+                  key: hydra-data
+            - name: HYDRA_DBI
+              valueFrom:
+                configMapKeyRef:
+                  name: hydra-config
+                  key: hydra-dbi
+            - name: HYDRA_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: hydra-config
+                  key: hydra-port
+            - name: NIX_REMOTE_SYSTEMS
+              valueFrom:
+                configMapKeyRef:
+                  name: hydra-config
+                  key: provisioner-systems
+            - name: LOGNAME
+              value: hydra
+            - name: NIX_REMOTE
+              valueFrom:
+                configMapKeyRef:
+                  name: hydra-config
+                  key: nix-remote
+
+      volumes:
+        - name: hydra-persistent
+          persistentVolumeClaim:
+            claimName: hydra
+        - name: hydra-postgres
+          persistentVolumeClaim:
+            claimName: hydra-postgres
+        - name: hydra-store
+          persistentVolumeClaim:
+            claimName: hydra-store
+        - name: hydra-store-db
+          persistentVolumeClaim:
+            claimName: hydra-store-db
+        - name: hydra-store-hack
+          emptyDir:  # no size limit, I think kube is bugged when counting size and counts mounted contents too
+        - name: nix-socket
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1M
+        - name: nix-gcroots
+          persistentVolumeClaim:
+            claimName: hydra-gcroots
+        - name: postgres-socket
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1M
+        - name: hydra-config
+          configMap:
+            name: hydra-config
+            items:
+              - key: hydra.conf
+                path: hydra.conf
+              - key: supervisord.conf
+                path: supervisord.conf
+              - key: crontab
+                path: crontab
+                mode: 0600
+        - name: provisioner-ephemeral
+          emptyDir:
+            sizeLimit: 64M
+        - name: ssh-key
+          secret:
+            secretName: hydra-ssh
+            optional: false
+        - name: attic-config
+          secret:
+            secretName: hydra-attic
+            optional: false
+        - name: nix-config
+          configMap:
+            name: hydra-config
+            items:
+              - key: nix.conf
+                path: nix.conf
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hydra
+  labels:
+    app: hydra
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hydra-postgres
+  labels:
+    app: hydra
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hydra-store
+  labels:
+    app: hydra
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hydra-store-db
+  labels:
+    app: hydra
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hydra-gcroots
+  labels:
+    app: hydra
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 64Mi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hydra-config
+  labels:
+    app: hydra
+data:
+  hydra-config: "/hydra-config/hydra.conf"
+  hydra-data: "/var/lib/hydra"
+  hydra-dbi: "dbi:Pg:dbname=hydra;user=hydra;"
+  hydra-port: "9223"
+  nix-remote: "daemon"
+  provisioner-systems: "/provisioner/systems"
+  hydra.conf: |
+    using_frontend_proxy = 1
+    base_uri = https://hydra.nixbsd.rhelmot.io/
+    max_servers = 8
+    use-substitutes = 1
+    max_unsupported_time = 120
+  nix.conf: |
+    allowed-users = *
+    trusted-users = *
+    extra-experimental-features = nix-command flakes
+    store = daemon
+    allowed-uris = github:nixos-bsd github:nixos github:artemist github:rhelmot git+https://git.lix.systems/artemist github:zhaofengli/attic
+    substituters = https://attic.mildlyfunctional.gay/nixbsd https://cache.nixos.org
+    trusted-public-keys = nixbsd:gwcQlsUONBLrrGCOdEboIAeFq9eLaDqfhfXmHZs1mgc= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+    builders-use-substitutes = true
+    sandbox = true
+    sandbox-fallback = false
+  supervisord.conf: |
+    [supervisord]
+    nodaemon=true
+    user=root
+    childlogdir=/log
+
+    [supervisorctl]
+    
+    [inet_http_server]
+    port=127.0.0.1:9001
+    
+    [rpcinterface:supervisor]
+    supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+    [program:nix-daemon]
+    command=nix-daemon --store local
+    redirect_stderr=true
+
+    [program:server]
+    command=hydra-server -f -h 0.0.0.0 -p %(ENV_HYDRA_PORT)s --min_spare_servers 1 --max_spare_servers 4 --max_servers 8 --max_requests 100 -d
+    user=hydra-www
+    environment=HYDRA_DBI="%(ENV_HYDRA_DBI)s;application_name=hydra-server",HOME="/home/hydra-www"
+    redirect_stderr=true
+
+    [program:evaluator]
+    command=hydra-evaluator
+    user=hydra
+    directory=%(ENV_HYDRA_DATA)s
+    environment=HYDRA_DBI="%(ENV_HYDRA_DBI)s;application_name=hydra-evaluator",HOME="/home/hydra"
+    redirect_stderr=true
+
+    [program:cron]
+    command=cron -fP
+    redirect_stderr=true
+
+    [program:queue-runner]
+    command=hydra-queue-runner -v
+    user=hydra-queue-runner
+    directory=%(ENV_HYDRA_DATA)s/queue-runner
+    environment=HYDRA_DBI="%(ENV_HYDRA_DBI)s;application_name=hydra-queue-runner",HOME="/home/hydra-queue-runner"
+    redirect_stderr=true
+
+    [program:update-gc-roots]
+    command=bash -c 'while true; do hydra-update-gc-roots; sleep 300; done'
+    user=hydra
+    environment=HYDRA_DBI="%(ENV_HYDRA_DBI)s;application_name=hydra-update-gc-roots",HOME="/home/hydra"
+    directory=%(ENV_HYDRA_DATA)s
+    redirect_stderr=true
+
+    [program:provisioner]
+    command=bash -c 'while true; do bash /provision.sh; sleep 20; done'
+    environment=HYDRA_DBI="%(ENV_HYDRA_DBI)s;application_name=provisioner"
+    redirect_stderr=true
+
+    [program:attic]
+    command=attic watch-store nixbsd
+    redirect_stderr=true
+
+  supervisord-worker.conf: |
+    [supervisord]
+    nodaemon=true
+    user=root
+    childlogdir=/log
+
+    [supervisorctl]
+    
+    [inet_http_server]
+    port=127.0.0.1:9001
+    
+    [rpcinterface:supervisor]
+    supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+    [program:nix-daemon]
+    command=nix-daemon --store local
+    redirect_stderr=true
+
+    [program:nix-gc]
+    command=bash -c 'while true; do nix-collect-garbage; sleep 3600; done'
+    redirect_stderr=true
+
+    [program:sshd]
+    command=/sbin/sshd -f /etc/ssh/sshd_config -D
+    redirect_stderr=true
+
+  sshd_config: |
+    Port 22
+    AddressFamily any
+    ListenAddress 0.0.0.0
+    ListenAddress ::
+
+    HostKey /var/ssh/ssh_host_ecdsa_key
+    AuthorizedKeysFile      .ssh/authorized_keys
+    PasswordAuthentication no
+    AllowTcpForwarding no
+    GatewayPorts no
+    X11Forwarding no
+    Subsystem       sftp    internal-sftp
+
+    SetEnv NIX_REMOTE=daemon
+
+  crontab: |
+    SHELL=/bin/bash
+    MAILTO=
+    0 6 * * *         supervisorctl stop queue-runner && nix-collect-garbage; supervisorctl start queue-runner
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hydra-provisioner
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["patch", "update"]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hydra-provisioner
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hydra-provisioner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hydra-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: hydra-provisioner
